@@ -1,5 +1,17 @@
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/spacelorddev)
 
+<div align="center">
+  <table>
+    <tr>
+      <td><img src="header.png" width="120" /></td>
+      <td>
+        <h1>Modern VLC UI</h1>
+        <p>A modernized Qt/QML interface redesign for VLC media player</p>
+      </td>
+    </tr>
+  </table>
+</div>
+
 # Modern VLC UI (Juxtopposed-inspired redesign)
 
 This is a locally modified build of [VLC media player](https://github.com/videolan/vlc) (VLC 4.0.0-dev) featuring a modernized Qt/QML interface inspired by Juxtopposed's VLC redesign concept.
