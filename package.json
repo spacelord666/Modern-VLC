@@ -1,0 +1,9 @@
+{
+  "name": "Modern VLC UI",
+  "version": "1.0.0",
+  "base": "vlc-4.0.0-dev-a5538c5",
+  "description": "VLC media player with modernized Qt/QML interface redesign",
+  "platform": "windows-x64",
+  "build_toolchain": "MSYS2/MinGW64",
+  "qt_version": "6.11.2"
+}

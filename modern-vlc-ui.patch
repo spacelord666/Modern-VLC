@@ -1,0 +1,915 @@
+diff --git a/bin/winvlc.c b/bin/winvlc.c
+index 14cc8de..9f87564 100644
+--- a/bin/winvlc.c
++++ b/bin/winvlc.c
+@@ -118,8 +118,12 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
+     /***
+      * The LoadLibrary* calls from the modules and the 3rd party code
+      * will search in SYSTEM32 only
++     *
++     * Local build: keep the legacy search order as well, so that the
++     * MSYS2 mingw64/bin dependencies (Qt6*.dll etc.) can be resolved
++     * through PATH for both VLC and Qt plugins.
+      * */
+-    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
++    /* SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32); */
+     /***
+      * Load DLLs from system32 before any other folder (when possible)
+      */
+diff --git a/buildsystem/check_qml_module.py b/buildsystem/check_qml_module.py
+index 23491c2..7191642 100644
+--- a/buildsystem/check_qml_module.py
++++ b/buildsystem/check_qml_module.py
+@@ -20,15 +20,20 @@ def checkQmakePath(path):
+     return True
+ 
+ def findProgram(path, progName):
+-    if not checkQmakePath(path):
+-        return None
+-
+-    progPath = os.path.join(path, progName)
+-    if not os.path.isfile(progPath):
++        if not checkQmakePath(path):
++            return None
++    
++        progPath = os.path.join(path, progName)
++        if os.path.isfile(progPath):
++            return progPath
++        # On Windows, try with .exe extension
++        if os.name == 'nt' and not progName.endswith('.exe'):
++            exePath = progPath + '.exe'
++            if os.path.isfile(exePath):
++                return exePath
++    
+         return None
+ 
+-    return progPath
+-
+ 
+ class QmlModuleChecker:
+     def __init__(self):
+@@ -79,7 +84,7 @@ class QmlModuleChecker:
+ 
+     def getInstallInfo(self, qmake, qtconf):
+         qmake_cmd = [ qmake, "-query" ]
+-        if qtconf:
++        if qtconf and qtconf not in ("no", ""):
+             qmake_cmd += [ "-qtconf", qtconf ]
+         ret = subprocess.run(
+             qmake_cmd,
+@@ -170,8 +175,12 @@ def main():
+     if not moduleChecker.getInstallInfo(args.qmake, args.qtconf):
+         exit(-1)
+ 
+-    with NamedTemporaryFile(mode="w+", suffix=".qml") as f:
++    # On Windows a NamedTemporaryFile kept open by this process cannot be
++    # opened by qmlimportscanner, so close it before scanning and clean it up.
++    f = NamedTemporaryFile(mode="w+", suffix=".qml", delete=False)
++    try:
+         moduleChecker.genQmlFile(f, args.modules)
++        f.close()
+ 
+         scanlist = moduleChecker.scanImports(f, args.modules)
+         if scanlist is None:
+@@ -179,6 +188,11 @@ def main():
+ 
+         if not moduleChecker.checkImports(scanlist, args.modules):
+             exit(-1)
++    finally:
++        try:
++            os.unlink(f.name)
++        except OSError:
++            pass
+ 
+     exit(0)
+ 
+diff --git a/contrib/src/gcrypt/rules.mak b/contrib/src/gcrypt/rules.mak
+index 31e7ed6..f471a0a 100644
+--- a/contrib/src/gcrypt/rules.mak
++++ b/contrib/src/gcrypt/rules.mak
+@@ -10,6 +10,10 @@ PKGS.tools += gcrypt
+ PKGS.tools.gcrypt.config-tool = libgcrypt-config
+ PKGS.tools.gcrypt.path = $(PREFIX)/bin/libgcrypt-config
+ endif
++ifneq ($(filter mingw%,$(subst -, ,$(HOST))),)
++# MinGW has libgcrypt
++PKGS_FOUND += gcrypt
++endif
+ 
+ $(TARBALLS)/libgcrypt-$(GCRYPT_VERSION).tar.bz2:
+ 	$(call download_pkg,$(GCRYPT_URL),gcrypt)
+diff --git a/contrib/src/gettext/rules.mak b/contrib/src/gettext/rules.mak
+index e1d4afe..7996e55 100644
+--- a/contrib/src/gettext/rules.mak
++++ b/contrib/src/gettext/rules.mak
+@@ -7,6 +7,10 @@ ifneq ($(filter gnu%,$(subst -, ,$(HOST))),)
+ # GNU platform should have gettext (?)
+ PKGS_FOUND += gettext
+ endif
++ifneq ($(filter mingw%,$(subst -, ,$(HOST))),)
++# MinGW has gettext-runtime
++PKGS_FOUND += gettext
++endif
+ 
+ $(TARBALLS)/gettext-$(GETTEXT_VERSION).tar.xz:
+ 	$(call download_pkg,$(GETTEXT_URL),gettext)
+@@ -25,39 +29,21 @@ gettext: gettext-$(GETTEXT_VERSION).tar.xz .sum-gettext
+ 	sed -i.orig -e 's,gettext-runtime libtextstyle gettext-tools,gettext-runtime libtextstyle,g' $(UNPACK_DIR)/configure
+ 	$(MOVE)
+ 
+-DEPS_gettext = iconv $(DEPS_iconv) libxml2 $(DEPS_libxml2)
+-
+-GETTEXT_CONF = \
+-	--disable-relocatable \
+-	--disable-java \
+-	--disable-native-java \
+-	--disable-csharp \
+-	--disable-d \
+-	--disable-go \
+-	--disable-modula2 \
+-	--disable-openmp \
+-	--without-emacs \
+-	--without-included-libxml \
+-	--without-git \
+-	--without-cvs
+-
+-ifdef HAVE_WIN32
+-GETTEXT_CONF += --disable-threads
+-endif
+-ifdef HAVE_LINUX
+-GETTEXT_CONF += --disable-libasprintf
+-endif
+-ifdef HAVE_MINGW_W64
+-GETTEXT_CONF += --disable-libasprintf
+-endif
+-
+-ifeq ($(findstring libxml2,$(PKGS_FOUND)),)
+-GETTEXT_CONF += --with-libxml2-prefix=$(PREFIX)
+-endif
++# Patch getopt-ext.h to use system getopt on mingw (avoid conflicting types)
++# This runs after MOVE so it patches the build directory source
++define PATCH_GETOPT_EXT
++	@for f in $(BUILD_DIR)/gettext-runtime/gnulib-lib/getopt-ext.h $(BUILD_DIR)/gettext-tools/gnulib-lib/getopt-ext.h; do \
++		if [ -f "$$f" ]; then \
++			sed -i '1,/^struct option/{/^struct option/,/^};/s/^struct option/#ifndef __MINGW64__\nstruct option/; /^};/a #endif}' $$f; \
++			sed -i '/^extern int getopt_long/,/^extern int getopt_long_only/ {/^extern int getopt_long/i #ifndef __MINGW64__; /^extern int getopt_long_only/a #endif}' $$f; \
++		fi; \
++	done
++endef
+ 
+ .gettext: gettext
+ 	$(MAKEBUILDDIR)
+ 	$(MAKECONFIGURE) $(GETTEXT_CONF)
++	$(PATCH_GETOPT_EXT)
+ 	+$(MAKEBUILD) -C gettext-runtime bin_PROGRAMS=
+ 	+$(MAKEBUILD) -C gettext-runtime bin_PROGRAMS= install
+ 	touch $@
+diff --git a/contrib/src/gnutls/rules.mak b/contrib/src/gnutls/rules.mak
+index 7368d7d..31fc2f7 100644
+--- a/contrib/src/gnutls/rules.mak
++++ b/contrib/src/gnutls/rules.mak
+@@ -23,6 +23,10 @@ endif
+ ifeq ($(call need_pkg,"gnutls >= 3.5.0"),)
+ PKGS_FOUND += gnutls
+ endif
++ifneq ($(filter mingw%,$(subst -, ,$(HOST))),)
++# MinGW has gnutls
++PKGS_FOUND += gnutls
++endif
+ 
+ $(TARBALLS)/gnutls-$(GNUTLS_VERSION).tar.xz:
+ 	$(call download_pkg,$(GNUTLS_URL),gnutls)
+diff --git a/contrib/src/goom/goom2k4-0-win32.patch b/contrib/src/goom/goom2k4-0-win32.patch
+index 208cf28..418edcb 100644
+--- a/contrib/src/goom/goom2k4-0-win32.patch
++++ b/contrib/src/goom/goom2k4-0-win32.patch
+@@ -1,14 +1,14 @@
+-diff -Naur goom-orig/configure.in goom/configure.in
+---- goom-2k4-0-src/configure.in.orig	2005-02-07 14:46:41.000000000 +0100
+-+++ goom-2k4-0-src/configure.in	2011-08-08 23:18:39.204832964 +0200
+-@@ -1,6 +1,5 @@
++diff -Naur goom-orig/configure.in goom/configure.in
++--- goom-2k4-0-src/configure.in.orig	2005-02-07 14:46:41.000000000 +0100
+++++ goom-2k4-0-src/configure.in	2011-08-08 23:18:39.204832964 +0200
++@@ -1,6 +1,5 @@
+  AC_INIT(README)
+  
+ -AM_DISABLE_STATIC
+  AM_INIT_AUTOMAKE(SDL_Goom, 2k4)
+  
+  ACLOCAL="$ACLOCAL -I m4"
+-@@ -76,24 +75,7 @@
++@@ -76,24 +75,7 @@
+  AM_CONDITIONAL(MACTARGET,test "x$MACTARGET" = "xyes")
+  
+  
+@@ -34,35 +34,35 @@ diff -Naur goom-orig/configure.in goom/configure.in
+  
+  dnl rm -f mmx_zoom.s
+  dnl 	echo -n checking for nasm...
+-diff -Naur goom-orig/src/filters.c goom/src/filters.c
+---- goom-orig/src/filters.c	2005-02-07 14:46:41.000000000 +0100
+-+++ goom/src/filters.c	2005-08-26 16:31:17.000000000 +0200
+-@@ -201,8 +201,8 @@
+-     /* Noise */
+-     if (data->noisify)
+-     {
+--        vx += (((float)random()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
+--        vy += (((float)random()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
+-+        vx += (((float)rand()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
+-+        vy += (((float)rand()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
+-     }
+-     
+-     /* Hypercos */
+-diff -Naur goom-orig/src/goom_core.c goom/src/goom_core.c
+---- goom-orig/src/goom_core.c	2005-02-07 14:46:41.000000000 +0100
+-+++ goom/src/goom_core.c	2005-08-26 16:33:01.000000000 +0200
+-@@ -40,11 +40,11 @@
+- static void init_buffers(PluginInfo *goomInfo, int buffsize)
+- {
+-     goomInfo->pixel = (guint32 *) malloc (buffsize * sizeof (guint32) + 128);
+--    bzero (goomInfo->pixel, buffsize * sizeof (guint32) + 128);
+-+    memset (goomInfo->pixel, 0, buffsize * sizeof (guint32) + 128);
+-     goomInfo->back = (guint32 *) malloc (buffsize * sizeof (guint32) + 128);
+--    bzero (goomInfo->back, buffsize * sizeof (guint32) + 128);
+-+    memset (goomInfo->back, 0, buffsize * sizeof (guint32) + 128);
+-     goomInfo->conv = (Pixel *) malloc (buffsize * sizeof (guint32) + 128);
+--    bzero (goomInfo->conv, buffsize * sizeof (guint32) + 128);
+-+    memset (goomInfo->conv, 0, buffsize * sizeof (guint32) + 128);
+- 
+-     goomInfo->outputBuf = goomInfo->conv;
+-     
++diff -Naur goom-orig/src/filters.c goom/src/filters.c
++--- goom-orig/src/filters.c	2005-02-07 14:46:41.000000000 +0100
+++++ goom/src/filters.c	2005-08-26 16:31:17.000000000 +0200
++@@ -201,8 +201,8 @@
++     /* Noise */
++     if (data->noisify)
++     {
++-        vx += (((float)random()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
++-        vy += (((float)random()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
+++        vx += (((float)rand()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
+++        vy += (((float)rand()) / ((float)RAND_MAX) - 0.5f) / 50.0f;
++     }
++     
++     /* Hypercos */
++diff -Naur goom-orig/src/goom_core.c goom/src/goom_core.c
++--- goom-orig/src/goom_core.c	2005-02-07 14:46:41.000000000 +0100
+++++ goom/src/goom_core.c	2005-08-26 16:33:01.000000000 +0200
++@@ -40,11 +40,11 @@
++ static void init_buffers(PluginInfo *goomInfo, int buffsize)
++ {
++     goomInfo->pixel = (guint32 *) malloc (buffsize * sizeof (guint32) + 128);
++-    bzero (goomInfo->pixel, buffsize * sizeof (guint32) + 128);
+++    memset (goomInfo->pixel, 0, buffsize * sizeof (guint32) + 128);
++     goomInfo->back = (guint32 *) malloc (buffsize * sizeof (guint32) + 128);
++-    bzero (goomInfo->back, buffsize * sizeof (guint32) + 128);
+++    memset (goomInfo->back, 0, buffsize * sizeof (guint32) + 128);
++     goomInfo->conv = (Pixel *) malloc (buffsize * sizeof (guint32) + 128);
++-    bzero (goomInfo->conv, buffsize * sizeof (guint32) + 128);
+++    memset (goomInfo->conv, 0, buffsize * sizeof (guint32) + 128);
++ 
++     goomInfo->outputBuf = goomInfo->conv;
++     
+diff --git a/contrib/src/gpg-error/rules.mak b/contrib/src/gpg-error/rules.mak
+index 7fd6ce3..36960cf 100644
+--- a/contrib/src/gpg-error/rules.mak
++++ b/contrib/src/gpg-error/rules.mak
+@@ -9,6 +9,10 @@ PKGS += gpg-error
+ ifeq ($(call need_pkg,"gpg-error >= 1.33"),)
+ PKGS_FOUND += gpg-error
+ endif
++ifneq ($(filter mingw%,$(subst -, ,$(HOST))),)
++# MinGW has libgpg-error
++PKGS_FOUND += gpg-error
++endif
+ 
+ .sum-gpg-error: libgpg-error-$(GPGERROR_VERSION).tar.bz2
+ 
+diff --git a/contrib/src/lua/rules.mak b/contrib/src/lua/rules.mak
+index 9cc7acc..571db2d 100644
+--- a/contrib/src/lua/rules.mak
++++ b/contrib/src/lua/rules.mak
+@@ -40,14 +40,16 @@ endif
+ 
+ ifeq ($(call need_pkg,"lua >= 5.1"),)
+ PKGS_FOUND += lua $(LUAC_IF_NOT_CROSS)
+-else
++endif
+ ifeq ($(call need_pkg,"lua5.2"),)
+ PKGS_FOUND += lua $(LUAC_IF_NOT_CROSS)
+-else
++endif
+ ifeq ($(call need_pkg,"lua5.1"),)
+ PKGS_FOUND += lua $(LUAC_IF_NOT_CROSS)
+ endif
+-endif
++ifneq ($(filter mingw%,$(subst -, ,$(HOST))),)
++# MinGW has lua
++PKGS_FOUND += lua luac
+ endif
+ 
+ ifeq ($(call system_tool_majmin, $(HOST)-luac -v),$(LUA_SHORTVERSION))
+diff --git a/contrib/src/main.mak b/contrib/src/main.mak
+index 2e3570d..2729bb5 100644
+--- a/contrib/src/main.mak
++++ b/contrib/src/main.mak
+@@ -292,13 +292,13 @@ ifeq ($(shell unset PKG_CONFIG_LIBDIR; $(HOST)-pkg-config --version 1>/dev/null
+ PKG_CONFIG ?= $(HOST)-pkg-config
+ else
+ # Use the regular pkg-config and set some PKG_CONFIG_LIBDIR ourselves
+-PKG_CONFIG_LIBDIR ?= /usr/$(HOST)/lib/pkgconfig:/usr/lib/$(HOST)/pkgconfig:/usr/share/pkgconfig
++PKG_CONFIG_LIBDIR ?= /usr/$(HOST)/lib/pkgconfig:/usr/lib/$(HOST)/pkgconfig:/usr/share/pkgconfig:/mingw64/lib/pkgconfig:/mingw64/share/pkgconfig
+ export PKG_CONFIG_LIBDIR
+ need_pkg = $(shell PKG_CONFIG_PATH=$(SYSTEM_PKG_CONFIG_PATH) PKG_CONFIG_LIBDIR=$(PKG_CONFIG_LIBDIR) $(PKG_CONFIG) $(1) || echo 1)
+ endif
+ endif # HAVE_CROSS_COMPILE
+ 
+-need_pkg ?= $(shell PKG_CONFIG_PATH=$(SYSTEM_PKG_CONFIG_PATH) $(PKG_CONFIG) $(1) || echo 1)
++need_pkg ?= $(shell PKG_CONFIG_PATH=$(SYSTEM_PKG_CONFIG_PATH) PKG_CONFIG_LIBDIR="$(PREFIX)/lib/pkgconfig:$(PREFIX)/share/pkgconfig:/mingw64/lib/pkgconfig:/mingw64/share/pkgconfig" $(PKG_CONFIG) $(1) || echo 1)
+ PKG_CONFIG ?= pkg-config
+ 
+ SYSTEM_PKG_CONFIG_PATH := $(PKG_CONFIG_PATH)
+@@ -550,7 +550,7 @@ ifdef HAVE_EMSCRIPTEN
+ CMAKECONFIG += -DEMSCRIPTEN_SYSTEM_PROCESSOR=$(ARCH)
+ endif
+ 
+-CMAKE = $(CMAKECONFIG) \
++CMAKE = $(MSYS_CMAKE_PREFIX)$(CMAKECONFIG) \
+ 		-DCMAKE_TOOLCHAIN_FILE=$(abspath toolchain.cmake) \
+ 		-DCMAKE_INSTALL_PREFIX:STRING=$(PREFIX)
+ CMAKE_NATIVE = $(CMAKECONFIG) \
+@@ -570,7 +570,7 @@ ifdef HAVE_DARWIN_OS
+ CMAKE += -DCMAKE_REQUIRED_FLAGS="-Werror=partial-availability"
+ endif
+ ifdef MSYS_BUILD
+-CMAKE = PKG_CONFIG_LIBDIR="$(PKG_CONFIG_PATH)" $(CMAKE)
++MSYS_CMAKE_PREFIX = PKG_CONFIG_LIBDIR="$(PKG_CONFIG_PATH)" 
+ CMAKE += -DCMAKE_LINK_LIBRARY_SUFFIX:STRING=.a
+ endif
+ ifdef HAVE_DARWIN_OS
+diff --git a/contrib/src/qtshadertools/rules.mak b/contrib/src/qtshadertools/rules.mak
+index 38ddc92..3402ce7 100644
+--- a/contrib/src/qtshadertools/rules.mak
++++ b/contrib/src/qtshadertools/rules.mak
+@@ -20,7 +20,7 @@ PKGS_FOUND += qtshadertools-tools
+ endif
+ 
+ $(TARBALLS)/qtshadertools-everywhere-src-$(QTSHADERTOOLS_VERSION).tar.xz:
+-	$(call download_pkg,$(QTSHADERTOOLS_URL),qtshadertools)
++	$(call download_pkg,$(QTSHADERTOOLS_URL),qt)
+ 
+ .sum-qtshadertools: qtshadertools-everywhere-src-$(QTSHADERTOOLS_VERSION).tar.xz
+ 
+diff --git a/contrib/src/zlib/rules.mak b/contrib/src/zlib/rules.mak
+index e3879ad..9abd024 100644
+--- a/contrib/src/zlib/rules.mak
++++ b/contrib/src/zlib/rules.mak
+@@ -3,9 +3,6 @@ ZLIB_VERSION := 1.3.2
+ ZLIB_URL := $(GITHUB)/madler/zlib/releases/download/v$(ZLIB_VERSION)/zlib-$(ZLIB_VERSION).tar.xz
+ 
+ PKGS += zlib
+-ifeq ($(call need_pkg,"zlib"),)
+-PKGS_FOUND += zlib
+-endif
+ 
+ $(TARBALLS)/zlib-$(ZLIB_VERSION).tar.xz:
+ 	$(call download_pkg,$(ZLIB_URL),zlib)
+diff --git a/extras/package/win32/build.sh b/extras/package/win32/build.sh
+index fa59486..0100691 100755
+--- a/extras/package/win32/build.sh
++++ b/extras/package/win32/build.sh
+@@ -266,7 +266,9 @@ case $LICENSE in
+     l)
+         # LGPL v3 + ad-clauses
+         CONTRIBFLAGS="$CONTRIBFLAGS --disable-gpl --enable-ad-clauses"
+-        CONFIGFLAGS="$CONFIGFLAGS --enable-live555"
++        if [ -z "$DISABLE_LIVE555" ]; then
++            CONFIGFLAGS="$CONFIGFLAGS --enable-live555"
++        fi
+     ;;
+     a)
+         # LGPL v2.1 + ad-clauses
+@@ -274,7 +276,9 @@ case $LICENSE in
+     ;;
+     g|*)
+         # GPL v3
+-        CONFIGFLAGS="$CONFIGFLAGS --enable-live555"
++        if [ -z "$DISABLE_LIVE555" ]; then
++            CONFIGFLAGS="$CONFIGFLAGS --enable-live555"
++        fi
+         if [ -z "$WINSTORE" ]; then
+             CONFIGFLAGS="$CONFIGFLAGS --enable-dvdread"
+             MCONFIGFLAGS="$MCONFIGFLAGS -Ddvdread=enabled"
+diff --git a/modules/gui/qt/Makefile.am b/modules/gui/qt/Makefile.am
+index df7bb49..71d16fc 100644
+--- a/modules/gui/qt/Makefile.am
++++ b/modules/gui/qt/Makefile.am
+@@ -1204,6 +1204,7 @@ libqml_module_playercontrols_a_QML = \
+ 	player/qml/controlbarcontrols/ArtworkInfoWidget.qml \
+ 	player/qml/controlbarcontrols/AspectRatioWidget.qml \
+ 	player/qml/controlbarcontrols/AtoBButton.qml \
++	player/qml/controlbarcontrols/AudioButton.qml \
+ 	player/qml/controlbarcontrols/BackButton.qml \
+ 	player/qml/controlbarcontrols/BookmarkButton.qml \
+ 	player/qml/controlbarcontrols/ChapterNextButton.qml \
+@@ -1240,6 +1241,7 @@ libqml_module_playercontrols_a_QML = \
+ 	player/qml/controlbarcontrols/SnapshotButton.qml \
+ 	player/qml/controlbarcontrols/SpacerWidget.qml \
+ 	player/qml/controlbarcontrols/StopButton.qml \
++	player/qml/controlbarcontrols/SubtitleButton.qml \
+ 	player/qml/controlbarcontrols/TeletextButton.qml \
+ 	player/qml/controlbarcontrols/TeletextColorButton.qml \
+ 	player/qml/controlbarcontrols/TeletextWidget.qml \
+diff --git a/modules/gui/qt/dialogs/toolbar/controlbar_profile_model.cpp b/modules/gui/qt/dialogs/toolbar/controlbar_profile_model.cpp
+index c27f44b..a2e6b40 100644
+--- a/modules/gui/qt/dialogs/toolbar/controlbar_profile_model.cpp
++++ b/modules/gui/qt/dialogs/toolbar/controlbar_profile_model.cpp
+@@ -102,9 +102,8 @@ decltype (ControlbarProfileModel::m_defaults)
+                         {
+                             {
+                                 {
+-                                    ControlListModel::LANG_BUTTON,
+-                                    ControlListModel::BOOKMARK_BUTTON,
+                                     ControlListModel::EXTENDED_BUTTON,
++                                    ControlListModel::BOOKMARK_BUTTON,
+                                     ControlListModel::NAVIGATION_BUTTONS
+                                 },
+                                 {
+@@ -115,7 +114,10 @@ decltype (ControlbarProfileModel::m_defaults)
+                                     ControlListModel::SKIP_FW_BUTTON
+                                 },
+                                 {
++                                    ControlListModel::SUBTITLE_BUTTON,
++                                    ControlListModel::AUDIO_BUTTON,
+                                     ControlListModel::VOLUME,
++                                    ControlListModel::PLAYLIST_BUTTON,
+                                     ControlListModel::RENDERER_BUTTON,
+                                     ControlListModel::FULLSCREEN_BUTTON
+                                 }
+@@ -127,21 +129,17 @@ decltype (ControlbarProfileModel::m_defaults)
+                         {
+                             {
+                                 {
+-                                    ControlListModel::LANG_BUTTON,
+-                                    ControlListModel::BOOKMARK_BUTTON,
+-                                    ControlListModel::EXTENDED_BUTTON
++                                    ControlListModel::RANDOM_BUTTON
+                                 },
+                                 {
+-                                    ControlListModel::RANDOM_BUTTON,
+                                     ControlListModel::PREVIOUS_BUTTON,
+                                     ControlListModel::PLAY_BUTTON,
+-                                    ControlListModel::NEXT_BUTTON,
+-                                    ControlListModel::LOOP_BUTTON
++                                    ControlListModel::NEXT_BUTTON
+                                 },
+                                 {
+-                                    ControlListModel::VOLUME,
+-                                    ControlListModel::RENDERER_BUTTON,
+-                                    ControlListModel::FULLSCREEN_BUTTON
++                                    ControlListModel::LOOP_BUTTON,
++                                    ControlListModel::PLAYLIST_BUTTON,
++                                    ControlListModel::VOLUME
+                                 }
+                             }
+                         }
+diff --git a/modules/gui/qt/meson.build b/modules/gui/qt/meson.build
+index f073abf..17c7d15 100644
+--- a/modules/gui/qt/meson.build
++++ b/modules/gui/qt/meson.build
+@@ -769,6 +769,7 @@ qml_modules += {
+        'player/qml/controlbarcontrols/ArtworkInfoWidget.qml',
+        'player/qml/controlbarcontrols/AspectRatioWidget.qml',
+        'player/qml/controlbarcontrols/AtoBButton.qml',
++       'player/qml/controlbarcontrols/AudioButton.qml',
+        'player/qml/controlbarcontrols/BackButton.qml',
+        'player/qml/controlbarcontrols/BookmarkButton.qml',
+        'player/qml/controlbarcontrols/ChapterNextButton.qml',
+@@ -805,6 +806,7 @@ qml_modules += {
+        'player/qml/controlbarcontrols/SnapshotButton.qml',
+        'player/qml/controlbarcontrols/SpacerWidget.qml',
+        'player/qml/controlbarcontrols/StopButton.qml',
++       'player/qml/controlbarcontrols/SubtitleButton.qml',
+        'player/qml/controlbarcontrols/TeletextButton.qml',
+        'player/qml/controlbarcontrols/TeletextColorButton.qml',
+        'player/qml/controlbarcontrols/TeletextWidget.qml',
+diff --git a/modules/gui/qt/player/control_list_model.hpp b/modules/gui/qt/player/control_list_model.hpp
+index 6f6afda..d40656f 100644
+--- a/modules/gui/qt/player/control_list_model.hpp
++++ b/modules/gui/qt/player/control_list_model.hpp
+@@ -82,8 +82,8 @@ public:
+         NAVIGATION_BUTTONS,
+         PROGRAM_BUTTON,
+         NAVIGATION_BOX,
+-        RESERVED_0X2B,
+-        RESERVED_0X2C,
++        SUBTITLE_BUTTON,
++        AUDIO_BUTTON,
+         RESERVED_0X2D,
+         RESERVED_0X2E,
+         RESERVED_0X2F,
+@@ -111,7 +111,8 @@ public:
+     Q_ENUM(ControlType)
+ 
+     static_assert(RESERVED_0X1F == 0x1F, "missaligned");
+-    static_assert(RESERVED_0X2B == 0x2B, "missaligned");
++    static_assert(SUBTITLE_BUTTON == 0x2B, "missaligned");
++    static_assert(AUDIO_BUTTON == 0x2C, "missaligned");
+     static_assert(RESERVED_0X3F == 0x3F, "missaligned");
+ 
+     // Basic functionality:
+diff --git a/modules/gui/qt/player/qml/ControlBar.qml b/modules/gui/qt/player/qml/ControlBar.qml
+index 0016705..221a7a1 100644
+--- a/modules/gui/qt/player/qml/ControlBar.qml
++++ b/modules/gui/qt/player/qml/ControlBar.qml
+@@ -49,7 +49,7 @@ T.Pane {
+     readonly property real sliderY: mapFromItem(contentItem, 0, contentItem.sliderY).y
+     property int textPosition: ControlBar.TimeTextPosition.AboveSlider
+     property int identifier: -1
+-    property real sliderHeight: VLCStyle.heightBar_xxsmall
++    property real sliderHeight: VLCStyle.playerSliderHeight
+     property real bookmarksHeight: VLCStyle.controlBarBookmarksHeight
+     property bool showRemainingTime: true
+ 
+@@ -316,11 +316,14 @@ T.Pane {
+ 
+             Layout.fillWidth: true
+             Layout.fillHeight: true
+-            Layout.leftMargin: VLCStyle.margin_large
+-            Layout.rightMargin: VLCStyle.margin_large
++            Layout.leftMargin: VLCStyle.margin_normal
++            Layout.rightMargin: VLCStyle.margin_normal
+ 
+             identifier: root.identifier
+ 
++            spacing: VLCStyle.playerControlBarSpacing
++            layoutSpacing: VLCStyle.playerControlBarSpacing
++
+             implicitHeight: MainCtx.pinVideoControls ? VLCStyle.controlLayoutHeightPinned
+                                                      : VLCStyle.controlLayoutHeight
+ 
+diff --git a/modules/gui/qt/player/qml/Player.qml b/modules/gui/qt/player/qml/Player.qml
+index e6688db..65424e2 100644
+--- a/modules/gui/qt/player/qml/Player.qml
++++ b/modules/gui/qt/player/qml/Player.qml
+@@ -60,6 +60,11 @@ FocusScope {
+                                         &&
+                                         (MainCtx.intfMainWindow.visibility !== Window.FullScreen))
+ 
++    // Reveal the top and bottom bars independently when the mouse rests near
++    // the corresponding edge of the window (Juxtopposed style).
++    property bool _topEdgeHover: false
++    property bool _bottomEdgeHover: false
++
+     property bool _keyPressed: false
+ 
+     // Settings
+@@ -985,7 +990,7 @@ FocusScope {
+         //initial state value is "", using a binding avoid animation on startup
+         Binding on state {
+             when: playerToolbarVisibilityFSM.started
+-            value: (playerToolbarVisibilityFSM.isVisible || rootPlayer._controlsUnderVideo) ? "visible" : "hidden"
++            value: (playerToolbarVisibilityFSM.isVisible || rootPlayer._controlsUnderVideo || rootPlayer._topEdgeHover) ? "visible" : "hidden"
+         }
+ 
+         onTogglePlaylistVisibility: playlistVisibility.togglePlaylistVisibility()
+@@ -1323,7 +1328,7 @@ FocusScope {
+         //initial state value is "", using a binding avoid animation on startup
+         Binding on state {
+             when: playerToolbarVisibilityFSM.started
+-            value: (playerToolbarVisibilityFSM.isVisible || rootPlayer._controlsUnderVideo) ? "visible" : "hidden"
++            value: (playerToolbarVisibilityFSM.isVisible || rootPlayer._controlsUnderVideo || rootPlayer._bottomEdgeHover) ? "visible" : "hidden"
+         }
+ 
+         onRequestLockUnlockAutoHide: (lock) => rootPlayer.lockUnlockAutoHide(lock)
+@@ -1358,6 +1363,38 @@ FocusScope {
+         }
+     }
+ 
++    // Detect the mouse resting near the top/bottom edges of the window so the
++    // corresponding toolbar can be revealed independently (Juxtopposed style).
++    Item {
++        id: _topEdgeHoverArea
++
++        anchors.top: parent.top
++        anchors.left: parent.left
++        anchors.right: parent.right
++        height: VLCStyle.playerToolbarHeight + VLCStyle.margin_small
++        z: 2
++
++        HoverHandler {
++            acceptedDevices: PointerDevice.Mouse | PointerDevice.Stylus
++            onHoveredChanged: rootPlayer._topEdgeHover = hovered
++        }
++    }
++
++    Item {
++        id: _bottomEdgeHoverArea
++
++        anchors.bottom: parent.bottom
++        anchors.left: parent.left
++        anchors.right: parent.right
++        height: VLCStyle.controlLayoutHeight + VLCStyle.margin_large
++        z: 2
++
++        HoverHandler {
++            acceptedDevices: PointerDevice.Mouse | PointerDevice.Stylus
++            onHoveredChanged: rootPlayer._bottomEdgeHover = hovered
++        }
++    }
++
+     QmlAudioContextMenu {
+         id: audioContextMenu
+ 
+@@ -1396,6 +1433,9 @@ FocusScope {
+                 interactiveAutoHideTimer.restart()
+             else
+                 playerToolbarVisibilityFSM.keyboardMove()
++
++            if (event.key === Qt.Key_H && (event.modifiers & Qt.ControlModifier))
++                playerToolbarVisibilityFSM.forceHide()
+         }
+     }
+ }
+diff --git a/modules/gui/qt/player/qml/PlayerControlbarControls.qml b/modules/gui/qt/player/qml/PlayerControlbarControls.qml
+index 19a0798..11d95a8 100644
+--- a/modules/gui/qt/player/qml/PlayerControlbarControls.qml
++++ b/modules/gui/qt/player/qml/PlayerControlbarControls.qml
+@@ -53,6 +53,8 @@ QtObject {
+         { id: ControlListModel.LOOP_BUTTON, file: "LoopButton.qml", label: VLCIcons.repeat_all, text: qsTr("Loop") },
+         { id: ControlListModel.INFO_BUTTON, file: "InfoButton.qml", label: VLCIcons.info, text: qsTr("Information") },
+         { id: ControlListModel.LANG_BUTTON, file: "LangButton.qml", label: VLCIcons.audiosub, text: qsTr("Open subtitles") },
++        { id: ControlListModel.SUBTITLE_BUTTON, file: "SubtitleButton.qml", label: "CC", text: qsTr("Subtitles") },
++        { id: ControlListModel.AUDIO_BUTTON, file: "AudioButton.qml", label: VLCIcons.audiosub, text: qsTr("Audio") },
+         { id: ControlListModel.BOOKMARK_BUTTON, file: "BookmarkButton.qml", label: VLCIcons.bookmark, text: qsTr("Bookmark Button") },
+         { id: ControlListModel.CHAPTER_PREVIOUS_BUTTON, file: "ChapterPreviousButton.qml", label: VLCIcons.dvd_prev, text: qsTr("Previous chapter") },
+         { id: ControlListModel.CHAPTER_NEXT_BUTTON, file: "ChapterNextButton.qml", label: VLCIcons.dvd_next, text: qsTr("Next chapter") },
+diff --git a/modules/gui/qt/player/qml/PlayerToolbarVisibilityFSM.qml b/modules/gui/qt/player/qml/PlayerToolbarVisibilityFSM.qml
+index ed325c9..7758727 100644
+--- a/modules/gui/qt/player/qml/PlayerToolbarVisibilityFSM.qml
++++ b/modules/gui/qt/player/qml/PlayerToolbarVisibilityFSM.qml
+@@ -54,6 +54,7 @@ FSM {
+     signal forceUnlock()
+     signal timeout()
+     signal updateVideoEmbed()
++    signal forceHide()
+  
+     //exposed internal states
+     property alias isVisible: fsmVisible.active
+@@ -72,6 +73,7 @@ FSM {
+         timeout: fsm.timeout,
+         unlock: fsm.unlock,
+         updateVideoEmbed: fsm.updateVideoEmbed,
++        forceHide: fsm.forceHide,
+     })
+  
+     FSMState {
+@@ -88,6 +90,10 @@ FSM {
+                 lock: {
+                     action: () => { fsm.lockCount++; },
+                     target: fsmLocked
++                },
++                forceHide: {
++                    action: () => { fsm.lockCount = 0; fsm.forceUnlock(); },
++                    target: fsmHidden
+                 }
+             })
+  
+diff --git a/modules/gui/qt/player/qml/SliderBar.qml b/modules/gui/qt/player/qml/SliderBar.qml
+index 4de1bc7..7a0e6b6 100644
+--- a/modules/gui/qt/player/qml/SliderBar.qml
++++ b/modules/gui/qt/player/qml/SliderBar.qml
+@@ -29,7 +29,7 @@ T.ProgressBar {
+     id: control
+ 
+     readonly property real _hoveredScalingFactor: 1.8
+-    property int barHeight: VLCStyle.dp(5, VLCStyle.scale)
++    property int barHeight: VLCStyle.playerSliderHeight
+     readonly property real _scaledBarHeight: control.barHeight * _hoveredScalingFactor
+     readonly property real _scaledY: (-control.barHeight / 2) * (control._hoveredScalingFactor - 1)
+ 
+@@ -433,7 +433,7 @@ T.ProgressBar {
+             visible: !Player.hasChapters
+             color: theme.fg.primary
+             height: control.barHeight
+-            radius: control._seekPointsRadius
++            radius: control.barHeight / 2
+ 
+             // We use dynamic mutability group because time interpolation
+             // may induce rapid change:
+@@ -568,14 +568,14 @@ T.ProgressBar {
+     Rectangle {
+         id: sliderHandle
+ 
+-        property int _size: control.barHeight * 3
++        property int _size: Math.max(control.barHeight * 3, VLCStyle.playerSeekHandleSize)
+ 
+         x: (control.visualPosition * control.availableWidth) - width / 2
+         y: (control.barHeight - height) / 2
+ 
+         implicitWidth: sliderHandle._size
+         implicitHeight: sliderHandle._size
+-        radius: VLCStyle.margin_small
++        radius: sliderHandle.width / 2
+         color: theme.fg.primary
+ 
+         // We use dynamic mutability group because time interpolation
+diff --git a/modules/gui/qt/player/qml/TopBar.qml b/modules/gui/qt/player/qml/TopBar.qml
+index eea8a0e..cdd94a1 100644
+--- a/modules/gui/qt/player/qml/TopBar.qml
++++ b/modules/gui/qt/player/qml/TopBar.qml
+@@ -446,6 +446,8 @@ FocusScope{
+             width: VLCStyle.bannerButton_width
+             height: VLCStyle.bannerButton_height
+ 
++            radius: VLCStyle.playerTopBarRadius
++
+             text: VLCIcons.more
+             description: qsTr("Menu")
+ 
+@@ -495,6 +497,8 @@ FocusScope{
+             width: VLCStyle.bannerButton_width
+             height: VLCStyle.bannerButton_height
+ 
++            radius: VLCStyle.playerTopBarRadius
++
+             plListView: root.plListView
+             
+             Navigation.parentItem: root
+diff --git a/modules/gui/qt/player/qml/controlbarcontrols/PlayButton.qml b/modules/gui/qt/player/qml/controlbarcontrols/PlayButton.qml
+index abc7acc..8fe9860 100644
+--- a/modules/gui/qt/player/qml/controlbarcontrols/PlayButton.qml
++++ b/modules/gui/qt/player/qml/controlbarcontrols/PlayButton.qml
+@@ -217,8 +217,7 @@ T.Control {
+                 return VLCIcons.play_filled
+         }
+ 
+-        color: cursorInside ? theme.accent
+-                            : "black"  //foreground is always black
++        color: "white"
+ 
+         font.pixelSize: Math.round(parent.height / 1.7)
+ 
+@@ -241,13 +240,13 @@ T.Control {
+ 
+     background: Item {
+         implicitWidth: height
+-        implicitHeight: VLCStyle.icon_medium
++        implicitHeight: VLCStyle.playerPlayButtonSize
+ 
+         Widgets.AnimatedBackground {
+             anchors.fill: parent
+             anchors.margins: -border.width * 4
+ 
+-            radius: width / 2
++            radius: VLCStyle.playerPlayButtonRadius
+             border.pixelAligned: false
+ 
+             enabled: theme.initialized
+@@ -258,7 +257,7 @@ T.Control {
+         Rectangle {
+             anchors.fill: parent
+ 
+-            radius: width / 2
++            radius: VLCStyle.playerPlayButtonRadius
+ 
+             gradient: Gradient {
+                 GradientStop { position: 0.0; color: "#e25b01" }
+@@ -280,13 +279,16 @@ T.Control {
+             Rectangle {
+                 id: innerRectangle
+ 
+-                color: "white"
++                // NOTE: must not cover the gradient below, otherwise the
++                //       white glyph is painted on a white surface.
++                //       Only shown as the press-and-hold feedback.
++                color: _diminished ? "#CCFFFFFF" : "transparent"
+ 
+                 anchors.fill: parent
+                 anchors.margins: _diminished ? (parent.width / 2)
+                                              : VLCStyle.dp(2, VLCStyle.scale)
+ 
+-                radius: width / 2
++                radius: VLCStyle.playerPlayButtonRadius
+ 
+                 property bool _diminished: false
+ 
+diff --git a/modules/gui/qt/player/qml/controlbarcontrols/VolumeWidget.qml b/modules/gui/qt/player/qml/controlbarcontrols/VolumeWidget.qml
+index 5811fb2..0197bc0 100644
+--- a/modules/gui/qt/player/qml/controlbarcontrols/VolumeWidget.qml
++++ b/modules/gui/qt/player/qml/controlbarcontrols/VolumeWidget.qml
+@@ -98,7 +98,7 @@ T.Pane {
+             id: volControl
+ 
+             // FIXME: use VLCStyle
+-            implicitWidth: VLCStyle.dp(100, VLCStyle.scale)
++            implicitWidth: VLCStyle.dp(120, VLCStyle.scale)
+ 
+             // WARNING: Directly setting the insets break handle and background positioning.
+             Binding on topInset {
+diff --git a/modules/gui/qt/scripts/genqmldir.py b/modules/gui/qt/scripts/genqmldir.py
+index 793f2b3..23c99c7 100644
+--- a/modules/gui/qt/scripts/genqmldir.py
++++ b/modules/gui/qt/scripts/genqmldir.py
+@@ -29,7 +29,10 @@ if __name__ == "__main__":
+     parser.add_argument("--sources", action='append', default=[], nargs='*', metavar=("CLASS"), help="mark CLASS as a singleton")
+ 
+     args = parser.parse_args()
+-    prefix = os.path.join("/", args.prefix, *args.module.split("."))
++    # Always use forward slashes: the qmldir "prefer" path is a Qt resource
++    # URL, so os.path.join (which emits backslashes on Windows) must not be
++    # used here.
++    prefix = "/" + "/".join(p for p in (args.prefix,) + tuple(args.module.split(".")) if p)
+     singletons = [os.path.join(args.srcdir, s) for s in args.singletons[0]]
+     files = [os.path.join(args.srcdir, relpath) for relpath in args.sources[0]]
+ 
+diff --git a/modules/gui/qt/scripts/qrc2rsp.py b/modules/gui/qt/scripts/qrc2rsp.py
+index e0b190e..d7e972c 100644
+--- a/modules/gui/qt/scripts/qrc2rsp.py
++++ b/modules/gui/qt/scripts/qrc2rsp.py
+@@ -14,7 +14,11 @@ def parseQrc(fdin, fdout):
+             if file.tag != "file":
+                 raise RuntimeError("unexpected qrc format")
+             alias = file.get("alias")
+-            fdout.write(os.path.join(prefix, alias))
++            # Resource paths in QML must always use forward slashes, even on
++            # Windows. os.path.join() would insert '\' there, which breaks
++            # qmlcachegen (the '\' gets emitted into C++ string literals as a
++            # bogus escape/universal-character-name).
++            fdout.write(prefix + "/" + alias)
+             fdout.write("\n")
+ 
+ 
+diff --git a/modules/gui/qt/scripts/static_dirs.py b/modules/gui/qt/scripts/static_dirs.py
+index b006854..f3119a0 100644
+--- a/modules/gui/qt/scripts/static_dirs.py
++++ b/modules/gui/qt/scripts/static_dirs.py
+@@ -18,7 +18,7 @@ def call_qmake(qmake:str, qtconf, builddir, pro, debug:bool) -> str:
+     qmake_cmd = [ qmake ]
+     if debug:
+         qmake_cmd += ['CONFIG+=debug']
+-    if qtconf and qtconf != '':
++    if qtconf and qtconf not in ('no', ''):
+         qmake_cmd += [ '-qtconf', qtconf ]
+     qmake_cmd += [pro, '-o', '-' ]
+     call = subprocess.Popen(qmake_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=builddir)
+diff --git a/modules/gui/qt/style/VLCStyle.qml b/modules/gui/qt/style/VLCStyle.qml
+index 929ed40..e3996f2 100644
+--- a/modules/gui/qt/style/VLCStyle.qml
++++ b/modules/gui/qt/style/VLCStyle.qml
+@@ -324,9 +324,20 @@ QtObject {
+     readonly property int controlBarBookmarksHeight: icon_xsmall * 0.9
+ 
+     // Player control layout
+-    readonly property int controlLayoutHeight: MainCtx.dp(64, scale)
++    readonly property int controlLayoutHeight: MainCtx.dp(72, scale)
+     readonly property int controlLayoutHeightPinned: MainCtx.dp(32, scale)
+ 
++    // "Juxtopposed" style redesign tokens
++    readonly property int playerToolbarHeight: MainCtx.dp(48, scale)
++    readonly property int playerControlBarSpacing: MainCtx.dp(20, scale)
++    readonly property int playerSliderHeight: MainCtx.dp(6, scale)
++    readonly property int playerControlIconSize: MainCtx.dp(28, scale)
++    readonly property int playerPlayButtonSize: MainCtx.dp(44, scale)
++    readonly property int playerPlayButtonRadius: MainCtx.dp(12, scale)
++    readonly property int playerControlBarRadius: MainCtx.dp(14, scale)
++    readonly property int playerTopBarRadius: MainCtx.dp(12, scale)
++    readonly property int playerSeekHandleSize: MainCtx.dp(18, scale)
++
+     // Scroll bar (size means width or height, depending on the orientation):
+     readonly property real scrollBarInteractingSize: MainCtx.dp(8, scale)
+     readonly property real scrollBarNonInteractingSize: MainCtx.dp(2, scale)
+diff --git a/src/win32/plugin.c b/src/win32/plugin.c
+index 32d4ae1..d7c8ee7 100644
+--- a/src/win32/plugin.c
++++ b/src/win32/plugin.c
+@@ -50,6 +50,10 @@ char *vlc_dlerror(void)
+     return FromWide( wmsg );
+ }
+ 
++#ifndef LOAD_LIBRARY_SEARCH_LIBRARY_PATH
++#define LOAD_LIBRARY_SEARCH_LIBRARY_PATH 0x00000100
++#endif
++
+ void *vlc_dlopen(const char *psz_file, bool lazy)
+ {
+     wchar_t *wfile = ToWide (psz_file);
+@@ -61,7 +65,7 @@ void *vlc_dlopen(const char *psz_file, bool lazy)
+     DWORD mode;
+     if (SetThreadErrorMode (SEM_FAILCRITICALERRORS, &mode) != 0)
+     {
+-        handle = LoadLibraryExW(wfile, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++        handle = LoadLibraryExW(wfile, NULL, LOAD_LIBRARY_SEARCH_LIBRARY_PATH | LOAD_LIBRARY_SEARCH_SYSTEM32);
+         SetThreadErrorMode (mode, NULL);
+     }
+ #elif WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+@@ -70,7 +74,7 @@ void *vlc_dlopen(const char *psz_file, bool lazy)
+     // SEM_FAILCRITICALERRORS is not available on Xbox, error messages are not
+     // possible. This is a sandboxed environment where the library dependencies
+     // need to be managed manually per platform.
+-    handle = LoadLibraryExW(wfile, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++    handle = LoadLibraryExW(wfile, NULL, LOAD_LIBRARY_SEARCH_LIBRARY_PATH | LOAD_LIBRARY_SEARCH_SYSTEM32);
+ #else
+ #error Unknown Windows Platform!
+ #endif
