@@ -66,3 +66,7 @@ All modifications in this repository are released under the same GPL license ter
 ## Version
 
 Based on VLC 4.0.0-dev (commit a5538c5)
+
+## Screenshot
+
+![Modern VLC UI](screenshot.png)
