@@ -86,10 +86,6 @@ If you find this build useful, we'd greatly appreciate your support! Any contrib
 Based on VLC 4.0.0-dev (commit a5538c5)
 
 ## Demo
-## Demo
-
-![Modern VLC UI Demo](demo.gif)
-
 ## Screenshot
 
 ![Modern VLC UI](screenshot.png)
