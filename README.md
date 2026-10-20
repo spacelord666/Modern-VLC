@@ -87,4 +87,6 @@ Based on VLC 4.0.0-dev (commit a5538c5)
 
 ## Screenshot
 
+![Modern VLC UI Demo](demo.gif)
+
 ![Modern VLC UI](screenshot.png)
