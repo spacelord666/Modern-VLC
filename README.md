@@ -59,10 +59,6 @@ The full license information and source can be found on the [official VLC GitHub
 All modifications in this repository are released under the same GPL license terms.
 
 ## Support
-## Support
-
-If you find this build useful, we'd greatly appreciate your support! Any contributions help cover development time and enable continued improvements, updates, and new features for this modern VLC UI redesign. If you'd like to show your support, you can do so via [Ko-fi](https://ko-fi.com/spacelorddev).
-
 ## Notes
 
 - These changes are local modifications to the VLC source tree for UI experimentation.
